@@ -59,11 +59,6 @@ createParameter = do
         sorted = sort . fmap (urlEncode *** urlEncodeT) $ params
     return . BS.intercalate "&" . map (\(k, v) -> k `BS.append` "=" `BS.append` v) $ sorted
 
-tap :: IO String -> IO String
-tap x = do
-  x >>= putStrLn
-  x
-
 createSignatureBaseString :: Reader AuthParams BS.ByteString
 createSignatureBaseString =
     BS.intercalate "&" . map urlEncodeBS <$> sequence [BS.pack <$> asks authHttpMethod, BS.pack <$> asks authUrl, createParameter]

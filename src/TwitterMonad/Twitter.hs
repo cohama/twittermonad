@@ -37,10 +37,18 @@ hoistExcept = ExceptT . return
 class (Monad m) => MonadTwitter m where
     homeTimeline :: m [Tweet]
     tweet :: String -> m ()
-    authenticate :: m (BS.ByteString, BS.ByteString)
 
 newtype Twitter a = Twitter { unTwitter :: ExceptT String (ReaderT Conf IO) a }
                     deriving (Functor, Applicative, Monad, MonadIO, MonadReader Conf)
+
+instance MonadTwitter Twitter where
+    homeTimeline = do
+        conf <- ask
+        let count = pack . show . homeTimelineDefaultCount $ conf
+        ts <- api Get "statuses/home_timeline.json" [("count", count)]
+        Twitter . hoistExcept . fromJSON $ ts
+
+    tweet t = void $ api Post "statuses/update.json" [("status", pack t)]
 
 
 runTwitter :: Conf -> Twitter a -> IO (Either String a)
@@ -48,7 +56,6 @@ runTwitter c t = flip runReaderT c . runExceptT . unTwitter $ t
 
 tryOr :: IO a -> (SomeException -> e) -> IO (Either e a)
 tryOr action onerr = (Right <$> action) `catch` (return . Left . onerr)
-
 
 api :: Http.HttpMethod -> String -> [(String, Text)] -> Twitter LBS.ByteString
 api method url params = do
@@ -63,49 +70,40 @@ api method url params = do
     ret' <- Twitter $ hoistExcept ret
     return $ ret' ^. responseBody
 
-instance MonadTwitter Twitter where
-    homeTimeline = do
-        conf <- ask
-        let count = pack . show . homeTimelineDefaultCount $ conf
-        ts <- api Get "statuses/home_timeline.json" [("count", count)]
-        Twitter . hoistExcept . fromJSON $ ts
+authenticate :: Twitter (BS.ByteString, BS.ByteString)
+authenticate = do
+    ckey <- authConsumerKey <$> ask
+    csec <- authConsumerSecret <$> ask
+    res <- liftIO $ Http.doRequest ckey csec "" ""
+                                   "https://api.twitter.com/"
+                                   Post "oauth/request_token"
+                                   [("oauth_callback", "oob")]
+    let body = res ^. responseBody
+        parse_params key = (A.string $ key `BS.snoc` '=')
+                           *> A.takeWhile (orf [(=='-'), isAlpha_ascii, isDigit])
+        parse_body = (,) <$> parse_params "oauth_token"
+                         <*> ("&" *> parse_params "oauth_token_secret")
+        result = LA.parse parse_body $ body
+    case result of
+        Done _ (token, tokensec) -> do
+            let url = "https://api.twitter.com/oauth/authenticate?oauth_token=" ++ show token
+            liftIO $ putStrLn $ "Opening " ++ url
+            liftIO $ system $ "xdg-open \"" ++ url ++ "\" > /dev/null 2>&1"
+            liftIO $ putStr "Input PIN > "
+            liftIO $ hFlush stdout
+            pin <- liftIO $ getLine
+            ckey <- authConsumerKey <$> ask
+            csec <- authConsumerSecret <$> ask
+            res' <- liftIO $ Http.doRequest ckey csec token tokensec
+                                           "https://api.twitter.com/"
+                                           Post "oauth/access_token"
+                                           [("oauth_verifier", pack pin)]
+            let body' = res' ^. responseBody
+            case LA.parse parse_body $ body' of
+                Done _ x -> return x
+                _ -> undefined
 
-    tweet t = void $ api Post "statuses/update.json" [("status", pack t)]
-
-    authenticate = do
-        ckey <- authConsumerKey <$> ask
-        csec <- authConsumerSecret <$> ask
-        res <- liftIO $ Http.doRequest ckey csec "" ""
-                                       "https://api.twitter.com/"
-                                       Post "oauth/request_token"
-                                       [("oauth_callback", "oob")]
-        let body = res ^. responseBody
-            parse_params key = (A.string $ key `BS.snoc` '=')
-                               *> A.takeWhile (orf [(=='-'), isAlpha_ascii, isDigit])
-            parse_body = (,) <$> parse_params "oauth_token"
-                             <*> ("&" *> parse_params "oauth_token_secret")
-            result = LA.parse parse_body $ body
-        case result of
-            Done _ (token, tokensec) -> do
-                let url = "https://api.twitter.com/oauth/authenticate?oauth_token=" ++ show token
-                liftIO $ putStrLn $ "Opening " ++ url
-                liftIO $ system $ "xdg-open \"" ++ url ++ "\" > /dev/null 2>&1"
-                liftIO $ putStr "Input PIN > "
-                liftIO $ hFlush stdout
-                pin <- liftIO $ getLine
-                ckey <- authConsumerKey <$> ask
-                csec <- authConsumerSecret <$> ask
-                res' <- liftIO $ Http.doRequest ckey csec token tokensec
-                                               "https://api.twitter.com/"
-                                               Post "oauth/access_token"
-                                               [("oauth_verifier", pack pin)]
-                let body' = res' ^. responseBody
-                case LA.parse parse_body $ body' of
-                    Done _ x -> return x
-                    _ -> undefined
-
-            _ -> undefined
-        -- Twitter . hoistExcept $ show <$> result
-            where
-                orf :: [a -> Bool] -> a -> Bool
-                orf xs c = or $ xs <*> [c]
+        _ -> undefined
+        where
+            orf :: [a -> Bool] -> a -> Bool
+            orf xs c = or $ xs <*> [c]
